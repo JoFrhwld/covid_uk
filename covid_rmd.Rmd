@@ -1,0 +1,205 @@
+---
+title: "covid19 uk"
+output: 
+  html_notebook: 
+    code_folding: none
+    theme: yeti
+date: "`r lubridate::now(tzone = 'GMT')` "
+author: "Josef Fruehwald"
+---
+
+**Caveats!**: I am not an epidemiologist. All I've got here is data as I wanted to see it.
+
+
+```{r load_libraries}
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(rvest)
+```
+
+
+
+todo:
+
+- convert the following 4 chunks to a function like `get_table(url)`
+
+```{r read_uk_data}
+covid_uk_url <- "https://en.wikipedia.org/wiki/Template:2019–20_coronavirus_pandemic_data/United_Kingdom_medical_cases_chart"
+temp_uk <-covid_uk_url %>% 
+  read_html %>%
+  html_nodes("table")
+```
+
+```{r read_it_data}
+covid_it_url <- "https://en.wikipedia.org/wiki/Template:2019–20_coronavirus_pandemic_data/Italy_medical_cases_chart"
+
+temp_it <-covid_it_url %>% 
+  read_html %>%
+  html_nodes("table")
+```
+
+Double check the parsing periodically.
+
+```{r parse_uk_data, message=FALSE, warning=FALSE}
+covid_uk_table <- html_table(temp_uk[[1]])
+colnames(covid_uk_table) <- c("date", "date2", "x", "number", "y")
+covid_uk_table %>%
+  select(date, number) %>%
+  slice(-1) %>%
+  mutate(number = gsub("\\(.*\\)|,", "", number),
+         number = as.numeric(number),
+         date = ymd(date),
+         country = "uk") %>%
+  filter(!is.na(date))%>%
+  complete(date = seq.Date(min(date), max(date), by = "day")) %>%
+  fill(number, country) -> covid_uk
+```
+
+```{r parse_it_data, message=FALSE, warning=FALSE}
+covid_it_table <- html_table(temp_it[[1]])
+colnames(covid_it_table) <- c("date", "date2", "x", "number", "y")
+covid_it_table %>%
+  select(date, number) %>%
+  slice(-1) %>%
+  mutate(number = gsub("\\(.*\\)|,", "", number),
+         number = as.numeric(number),
+         date = ymd(date),
+         country = "it") %>%
+  filter(!is.na(date))%>%
+  complete(date = seq.Date(min(date), max(date), by = "day")) %>%
+  fill(number, country) -> covid_it
+
+```
+
+## Plots
+
+Basic number of cases in UK and Italy on linear scales.
+
+```{r uk_cases}
+covid_uk %>%
+  ggplot(aes(date, number))+
+    geom_line(size = 1)+
+    ggtitle("UK coronavirus cases")
+```
+```{r it_cases}
+covid_it %>%
+  ggplot(aes(date, number))+
+    geom_line(size = 1)+
+    ggtitle("Italy Coronavirus Cases")
+```
+
+I wanted to see how the increase in cases in the UK compared to Italy, so this is a plot showing the number of cases since they had a roughly similar number. 
+
+Itally had a steeper rise for a while, hence the upward shift of the trend. Still looks broadly parallel to the UK trend.
+
+```{r it_uk_comp}
+bind_rows(covid_uk, covid_it)%>%
+  filter(number >=75)%>%
+  group_by(country)%>%
+  mutate(day = 1:n())%>%
+  ggplot(aes(day, number, color = country))+
+    geom_line()+
+    stat_smooth(method = "lm", se = F)+
+    scale_y_log10()+
+    xlab("days since ncases approx 75")+
+    ylab("number (log scale)")+
+    scale_color_brewer(palette = "Dark2")+
+    ggtitle("Coronavirus cases since ncases approx 75")
+```
+
+## log(cases)~date modelling
+
+It looks like the increase in cases in the UK has been linear in a log-space since March 1.
+```{r loglin_trend}
+covid_uk %>%
+  filter(date >= ymd("2020-3-1")) %>%
+  ggplot(aes(date, number))+
+    geom_line()+
+    stat_smooth(method = "lm", se = F)+
+    scale_y_log10("number (log scale)", labels = comma_format())+
+    scale_x_date(breaks = seq.Date(ymd("2020-3-1"), today(), by = 7),
+                 minor_breaks = seq.Date(ymd("2020-3-1"), today(), by = "day"),
+                 date_labels = "%d %b %Y")+
+    ggtitle("model of coronavirus cases")
+```
+
+I wanted to look at a rolling model of the rate of increase.
+
+
+
+```{r}
+date_windows <- function(start, end, window_len){
+  starts = seq.Date(start, end-(window_len-1), by = "day")
+  ends = seq.Date(start+(window_len-1), end, by = "day")
+  out_list <- map2(starts, ends, c)
+  return(out_list)
+}
+
+slope_mod <- function(df, range){
+  use_df <- df %>% filter(date >= range[1], date <= range[2])
+  model <- lm(log(number) ~ date, data = use_df)
+  return(model)
+}
+```
+
+```{r}
+window_len = 7
+windows <- date_windows(ymd("2020-3-1"), today(), window_len = window_len)
+starts <- seq.Date(ymd("2020-3-1"), today()-(window_len-1), by = "day")
+map(windows, ~slope_mod(covid_uk, .x)) %>% 
+  map(summary)%>%
+  map(~data.frame(rbind(.x$coefficients["date", 1:2])))%>%
+  bind_rows() %>%
+  mutate(start = starts,
+         country = "uk") -> slope_uk_df
+map(windows, ~slope_mod(covid_it, .x)) %>% 
+  map(summary)%>%
+  map(~data.frame(rbind(.x$coefficients["date", 1:2])))%>%
+  bind_rows() %>%
+  mutate(start = starts,
+         country = "it") -> slope_it_df
+
+bind_rows(slope_uk_df, slope_it_df) %>%
+  ggplot(aes(start, exp(Estimate), color = country))+
+    geom_point()+
+    geom_line()+
+    expand_limits(y = 1)+
+    ylab("estimated rate of increase")+
+    xlab(paste0(window_len, " day window starting on date"))+
+    scale_color_brewer(palette = "Dark2")
+
+```
+
+If the current number of confirmed cases represent the number of people who were infected 14 days ago, and we project forward 14 days from now, this is what it looks like:
+
+```{r log_mod}
+covid_uk %>%
+  filter(date >= ymd("2020-3-1")) %>%
+  lm(log(number) ~ date, data = .) -> mod
+```
+
+```{r log_mod_pred}
+pred <- data.frame(date = seq.Date(ymd("2020-3-1"), today()+14, by = "day"))
+pred$number <- predict(mod, newdata = pred)
+```
+
+
+```{r log_mod_pred_plot, message=FALSE, warning=FALSE}
+pred%>%
+  ggplot(aes(date - 14, exp(number)))+
+    geom_vline(xintercept = today(), linetype = 3)+
+    geom_line(data = covid_uk %>% filter(date >= ymd("2020-3-1")),
+              aes(date = date-14,
+                  y = number),
+              size = 1)+
+    geom_line(color = "blue", size = 1)+
+    scale_y_log10("number (log scale)", labels = comma_format())+
+    scale_x_date(breaks = seq.Date(ymd("2020-3-1")-14, today(), by = 7),
+                 date_labels = "%d %b %Y")
+```
+
+
+
+
+
