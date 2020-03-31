@@ -1,0 +1,271 @@
+---
+title: "Death Rate Modelling"
+output: 
+  html_notebook: 
+    theme: yeti
+date: "`r lubridate::now()` "
+author: "Josef Fruehwald"
+---
+
+I'm fitting cublic regression splines to the cumulative number of deaths, restricted to be monotonically increasing. To get indication of the uncertainty of the models, I'm bootstrapping 1,000 models.
+
+
+
+```{r libraries}
+library(tidyverse)
+library(gghighlight)
+library(httr)
+library(utils)
+library(lubridate)
+library(mgcv)
+library(itsadug)
+library(ggthemes)
+library(magrittr)
+library(boot)
+library(stringi)
+```
+
+I'm getting the data from ECDC [https://www.ecdc.europa.eu/en/publications-data/download-todays-data-geographic-distribution-covid-19-cases-worldwide](https://www.ecdc.europa.eu/en/publications-data/download-todays-data-geographic-distribution-covid-19-cases-worldwide)
+
+
+
+```{r get_ecdc_data}
+# their api for this seems to be changing daily
+
+GET("https://opendata.ecdc.europa.eu/covid19/casedistribution/csv", authenticate(":", ":", type="ntlm"), write_disk(tf <- tempfile(fileext = ".csv")))
+
+#read the Dataset sheet into “R”. The dataset will be called "data".
+data <- read.csv(tf)
+```
+
+This is the code for fitting a spline that is monotonic.
+
+```{r}
+# https://gist.github.com/jnpaulson/c47f9bd3246f1121ad3a911e5f707355
+mspline<-function(x,y,k=10,lower=NA,upper=NA){
+  #fits a monotonic spline to data
+  #small values of k= more smoothing (flatter curves)
+  #large values of k= more flexible (wiggly curves)
+  #k is related to effective degrees of freedom and number of knots
+  #use unconstrained gam to get rough parameter estimates
+  #lower, upper optional bounds on the function
+  #basically a slight modification of an example in the mgcv::pcls documentation
+  dat<-data.frame(x=x,y=y)
+  init_gam <- gam(y~s(x,k=k,bs="cr"))
+  # Create Design matrix, constraints etc. for monotonic spline....
+  sm <- smoothCon(s(x,k=k,bs="cr"),dat,knots=NULL)[[1]]
+  mc <- mono.con(sm$xp,lower=lower,upper=upper) # monotonicity constraints
+  M <- list(X=sm$X, y=y, #design matrix, outcome
+            C=matrix(0,0,0), #equality constraints (none)
+            Ain=mc$A, bin=mc$b, #inequality constraints
+            sp=init_gam$sp, p=sm$xp, #initial guesses for param estimates
+            S=sm$S, #smoothness penalty matrix
+            w=y*0+1, off=0 #weights, offset
+            )
+  #fit spine using penalized constrained least squares
+  p<-pcls(M)
+  return(list(sm=sm,p=p))
+}
+
+predict.mspline<-function(msp,x){
+  #using the monotone spline msp, predict values for the vector x
+  Predict.matrix(msp$sm,data.frame(x=x))%*%msp$p
+}
+
+```
+
+
+Since I'm measuring time for each country according to how many days since 10 deaths, it would be inappropriate to use the same number of knots for each country's data. Also, since bootstrapping produces a different number of unique x values in each replciate, I'm setting the number of knots to half the number of unique x values per replicate. This produces some very different smooths across bootstraps, but since I'm overplotting all the replicates, I'm sticking with it as an indicator of the fragility of the estimates.
+
+```{r}
+do_msmooth <- function(data, inds, pred_x){
+  nunique <- length(unique(data$ndays[inds]))
+  knots = floor(nunique/2)
+  M <- mspline(data$ndays[inds], log(data$total_deaths[inds]), 
+               k = ifelse(knots < 4, 4, knots))
+  pred <- predict.mspline(M, pred_x)
+  return(pred)
+}
+```
+
+
+I'm going to focus on `modellable_data`, which is countries which have had at least 10 total deaths, and at least 15 days worth of data from their 10th death.
+
+```{r}
+# the cedilla in Curaçao is messing things up. I'll fix it at some point
+data %>%
+  filter(stri_enc_isutf8(countriesAndTerritories))%>% # A hack for now :(
+  mutate(countriesAndTerritories = tolower(countriesAndTerritories),
+         date = dmy(dateRep))%>%
+  group_by(countriesAndTerritories)%>%
+  mutate(total = sum(deaths)) %>%
+  ungroup() %>%
+  mutate(country =  reorder(countriesAndTerritories, -total, min)) %>%
+  group_by(country)%>%
+  arrange(date) %>%
+  mutate(total_deaths = cumsum(deaths)) ->data_proc
+
+data_proc %>%
+  filter(total_deaths >=10)%>%
+  mutate(ndays = 1:n())%>%
+  filter(max(ndays) >= 15)->modellable_data
+```
+
+
+A table of feaths as of the most recent date.
+```{r}
+data_proc%>%
+  mutate(date = dmy(dateRep)) %>%
+  group_by(country)%>%
+  slice(n())%>%
+  select(date, country, deaths, total_deaths)%>%
+  arrange(-total_deaths)
+```
+
+I'm also overplotting dates of national lockdowns.
+```{r message=FALSE, warning=FALSE}
+lockdowns <- tribble(
+  ~country, ~date,
+  "italy", ymd("2020-3-9"),
+  "spain", ymd("2020-3-14"),
+  "china", ymd("2020-1-23"),
+  "france", ymd("2020-3-17"),
+  "united_kingdom", ymd("2020-3-23")
+)%>%
+  left_join(modellable_data) %>%
+  mutate(country = factor(country),
+         country = reorder(country, -total, mean))
+```
+
+
+Here is the overall cumulative deaths, log-scale
+```{r fig.height=3.33, fig.width = 3.44}
+modellable_data %>%
+  ggplot(aes(ndays, total_deaths, color = country))+
+  geom_line(size = 1)+
+  gghighlight(use_direct_label = F)+
+  geom_vline(data = lockdowns, aes(xintercept = ndays), 
+             linetype = 1, 
+             color = "grey30")+
+  geom_vline(data = lockdowns, aes(xintercept = ndays+14), 
+             linetype = 3,
+             color = "grey30")+
+  facet_wrap(~country)+
+  scale_color_discrete(l = 50, guide = "none")+
+  scale_y_log10("cumulative deaths (log scale)")+
+  xlab("number of days since 10 deaths")+
+  theme_minimal()
+```
+
+This does the bootstrapping.
+```{r}
+modellable_data %>%
+  nest()%>%
+  mutate(boot = map(data, ~boot(.x,
+                                statistic = do_msmooth, 
+                                R = 1000, 
+                                stype = "i",
+                                pred_x = 1:nrow(.x))),
+         boot_df = map(boot, ~data.frame(t(.x$t)) %>% 
+                         rownames_to_column("ndays") %>% 
+                         gather("draw", "value", -1)))%>%
+  unnest(boot_df)%>%
+  group_by(country, draw) %>%
+  mutate(diff = value-lag(value),
+         rate = exp(diff)) %>%
+  select("country", "ndays", "draw", "value", "diff", "rate")->bootstraps
+```
+
+
+Just to check that the models aren't over- or under- smoothing the data.
+```{r model_sanity_check, fig.height=5, fig.width=5}
+bootstraps %>%
+  ggplot(aes(as.numeric(ndays), exp(value), color = country))+
+    geom_line(aes(group = draw), alpha = 0.02)+
+    geom_point(data = modellable_data, aes(y = total_deaths),
+               color = "black", size = 0.5)+
+    scale_y_log10()+
+    facet_wrap(~country)+
+    xlab("ndays since 10 total deaths")+
+    ylab("cumulative deaths (log scale)")+
+    scale_color_discrete(guide = "none", l = 50)+
+    theme_minimal()
+```
+
+
+This is a plot of daily estimated rate of increase of total deaths (down is good).
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+bootstraps %>%
+  mutate(ndays = as.numeric(ndays)) %>%
+  group_by(country, ndays)%>%
+  summarise(rate = median(rate))%>%
+  filter(is.finite(rate))%>%
+  ungroup() %>%
+  mutate(country2 = country,
+         country = NULL)->rate_trends
+
+
+bootstraps %>%
+  ggplot(aes(as.numeric(ndays), rate, color = country))+
+    geom_hline(yintercept = 1.3, linetype = 2)+
+      geom_line(data = rate_trends, 
+              aes(group = country2),
+              color = "grey60")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays), 
+               linetype = 1, 
+               color = "grey30")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays+14), 
+               linetype = 3,
+               color = "grey30")+
+    geom_line(aes(group = draw), alpha = 0.02)+
+    facet_wrap(~country)+
+    scale_y_log10("cumulative death daily increase rate (log scale)",
+                  minor_breaks = NULL)+
+    xlim(1,40)+
+    xlab("ndays sice 10 total deaths")+
+    scale_color_discrete(guide = "none", l = 50)+
+    theme_minimal()+
+    ggtitle("daily rate of increase")
+```
+
+
+This is a plot of daily estimated 'doubling rate' (up is good).
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+
+bootstraps %>%
+  mutate(doubling = log(2, base = rate),
+         ndays = as.numeric(ndays)) %>%
+  group_by(country, ndays)%>%
+  summarise(doubling = median(doubling))%>%
+  filter(is.finite(doubling))%>%
+  ungroup() %>%
+  mutate(country2 = country,
+         country = NULL)->doubling_trends
+
+bootstraps %>%
+  mutate(doubling = log(2, base = rate),
+         ndays = as.numeric(ndays)) %>%
+  #filter(ndays <= 30)%>%
+  ggplot(aes(as.numeric(ndays), doubling, color = country))+
+    geom_line(data = doubling_trends, 
+              aes(group = country2),
+              color = "grey60")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays), 
+               linetype = 1, 
+               color = "grey30")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays+14), 
+               linetype = 3,
+               color = "grey30")+  
+    geom_line(aes(group = draw), alpha = 0.02)+
+    facet_wrap(~country)+
+    scale_y_log10("'doubling' rate every Y days",
+                  breaks = c(1, 3, 7, 14, 30, 60),
+                  limits = c(1, 60),
+                  minor_breaks = NULL)+
+    xlim(1,40)+
+    xlab("ndays sice 10 total deaths")+
+    scale_color_discrete(guide = "none", l = 50)+
+    theme_minimal()+
+    ggtitle("daily 'doubling rate' estimate")
+```
+
