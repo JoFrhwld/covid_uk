@@ -108,7 +108,13 @@ data %>%
 data_proc %>%
   filter(total_deaths >=10)%>%
   mutate(ndays = 1:n())%>%
-  filter(max(ndays) >= 15)->modellable_data
+  filter(max(ndays) >= 15) %>%
+  group_by(country)%>%
+  nest() %>%
+  arrange(country) %>%
+  ungroup()%>%
+  filter(country  %in% country[1:10] | country %in% c("japan", "china", "south_korea")) %>%
+  unnest(data) ->modellable_data
 ```
 
 
@@ -121,6 +127,8 @@ data_proc%>%
   select(date, country, deaths, total_deaths)%>%
   arrange(-total_deaths)
 ```
+
+
 
 I'm also overplotting dates of national lockdowns.
 ```{r message=FALSE, warning=FALSE}
@@ -139,7 +147,7 @@ lockdowns <- tribble(
 
 
 Here is the overall cumulative deaths, log-scale
-```{r fig.height=3.33, fig.width = 3.44}
+```{r fig.width = 5, fig.height = 5}
 modellable_data %>%
   ggplot(aes(ndays, total_deaths, color = country))+
   geom_line(size = 1)+
@@ -160,6 +168,7 @@ modellable_data %>%
 This does the bootstrapping.
 ```{r}
 modellable_data %>%
+  group_by(country) %>%
   nest()%>%
   mutate(boot = map(data, ~boot(.x,
                                 statistic = do_msmooth, 
@@ -194,7 +203,9 @@ bootstraps %>%
 
 
 This is a plot of daily estimated rate of increase of total deaths (down is good).
-```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+<div style="width:100%">
+<div style="width:75%;margin:auto;">
+```{r fig.height=3, fig.width=3, message=FALSE, warning=FALSE, echo = F}
 bootstraps %>%
   mutate(ndays = as.numeric(ndays)) %>%
   group_by(country, ndays)%>%
@@ -206,15 +217,16 @@ bootstraps %>%
 
 
 bootstraps %>%
+  ungroup() %>%
   ggplot(aes(as.numeric(ndays), rate, color = country))+
     geom_hline(yintercept = 1.3, linetype = 2)+
-      geom_line(data = rate_trends, 
+    geom_line(data = rate_trends,
               aes(group = country2),
               color = "grey60")+
-    geom_vline(data = lockdowns, aes(xintercept = ndays), 
-               linetype = 1, 
+    geom_vline(data = lockdowns, aes(xintercept = ndays),
+               linetype = 1,
                color = "grey30")+
-    geom_vline(data = lockdowns, aes(xintercept = ndays+14), 
+    geom_vline(data = lockdowns, aes(xintercept = ndays+14),
                linetype = 3,
                color = "grey30")+
     geom_line(aes(group = draw), alpha = 0.02)+
@@ -228,9 +240,13 @@ bootstraps %>%
     ggtitle("daily rate of increase")
 ```
 
+</div>
+</div>
 
 This is a plot of daily estimated 'doubling rate' (up is good).
-```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+<div style="width:100%">
+<div style="width:75%;margin:auto;">
+```{r fig.height=4, fig.width=4, message=FALSE, warning=FALSE, echo = F}
 
 bootstraps %>%
   mutate(doubling = log(2, base = rate),
@@ -268,4 +284,37 @@ bootstraps %>%
     theme_minimal()+
     ggtitle("daily 'doubling rate' estimate")
 ```
+</div>
+</div>
+# Self Obsession
 
+<div style="width:100%">
+<div style="width:75%;margin:auto;">
+```{r fig.height=3, fig.width=3, message=FALSE, warning=FALSE, echo = F}
+bootstraps %>%
+  ungroup() %>%
+  filter(country %in% c("united_states_of_america", "united_kingdom", "italy",
+                        "france", "china", "spain"))%>%
+  ggplot(aes(as.numeric(ndays), rate, color = country))+
+    geom_hline(yintercept = 1.3, linetype = 2)+
+    geom_line(data = rate_trends,
+              aes(group = country2),
+              color = "grey60")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays),
+               linetype = 1,
+               color = "grey30")+
+    geom_vline(data = lockdowns, aes(xintercept = ndays+14),
+               linetype = 3,
+               color = "grey30")+
+    geom_line(aes(group = draw), alpha = 0.02)+
+    facet_wrap(~country)+
+    scale_y_log10("cumulative death daily increase rate (log scale)",
+                  minor_breaks = NULL)+
+    xlim(1,40)+
+    xlab("ndays sice 10 total deaths")+
+    scale_color_discrete(guide = "none", l = 50)+
+    theme_minimal()+
+    ggtitle("daily rate of increase")
+```
+</div>
+</div>
